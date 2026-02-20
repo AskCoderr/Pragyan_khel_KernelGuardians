@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">KernelGuardians Focus</string>
+    <string name="tap_to_track">TAP TO TRACK</string>
+    <string name="tracking_locked">TRACKING: LOCKED</string>
+    <string name="tracking_lost">TRACKING: LOST (PREDICTING)</string>
+    <string name="tracking_searching">SEARCHING…</string>
+    <string name="camera_permission_required">Camera permission is required</string>
+    <string name="bg_blur_on">BG BLUR: ON</string>
+    <string name="bg_blur_off">BG BLUR: OFF</string>
+</resources>

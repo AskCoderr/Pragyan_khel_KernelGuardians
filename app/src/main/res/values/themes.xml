@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.PragyanKernelGuardians" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#FF00C853</item>
+        <item name="colorPrimaryVariant">#FF00E676</item>
+        <item name="colorOnPrimary">#FF000000</item>
+        <item name="colorSecondary">#FF2196F3</item>
+        <item name="colorOnSecondary">#FFFFFFFF</item>
+        <item name="android:statusBarColor">#00000000</item>
+        <item name="android:navigationBarColor">#00000000</item>
+        <item name="android:windowTranslucentStatus">true</item>
+        <item name="android:windowTranslucentNavigation">true</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+</resources>
