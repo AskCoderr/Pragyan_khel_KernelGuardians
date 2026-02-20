@@ -12,12 +12,14 @@
         android:layout_height="match_parent"
         android:keepScreenOn="true" />
 
-    <!-- OpenGL ES rendering surface (background blur) -->
-    <android.opengl.GLSurfaceView
-        android:id="@+id/glSurfaceView"
+    <!-- CPU blur composite output (portrait mode blur) -->
+    <ImageView
+        android:id="@+id/blurOverlayView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        android:scaleType="centerCrop"
         android:visibility="gone" />
+
 
     <!-- Tracking boxes + segmentation overlay -->
     <com.pragyan.kernelguardians.rendering.OverlayView

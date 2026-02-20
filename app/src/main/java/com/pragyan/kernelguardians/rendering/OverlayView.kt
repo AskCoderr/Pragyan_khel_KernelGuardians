@@ -1,17 +1,26 @@
 package com.pragyan.kernelguardians.rendering
 
+import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Paint
 import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.View
+import android.view.animation.LinearInterpolator
 import com.pragyan.kernelguardians.tracking.TrackingState
 
 /**
- * Transparent overlay that draws the ML-Kit bounding box + tracking state label.
- * Updated by [ObjectTracker] on every processed frame via [update].
+ * Transparent overlay that draws a professional corner-bracket tracking indicator.
+ *
+ * Visual style (inspired by DSLR viewfinders / drone cameras):
+ *  - 4 L-shaped corner brackets (no full border)
+ *  - Very subtle semi-transparent fill
+ *  - Pulsing bracket opacity when LOCKED
+ *  - Thin dashed perimeter when PREDICTING
+ *  - Red brackets when SEARCHING
  */
 class OverlayView @JvmOverloads constructor(
     context: Context,
@@ -21,37 +30,67 @@ class OverlayView @JvmOverloads constructor(
 
     private val density = context.resources.displayMetrics.density
 
-    private val lockedColor  = Color.parseColor("#FF00C853") // green
-    private val predictColor = Color.parseColor("#FFFFC107") // amber — Kalman predicting
-    private val searchColor  = Color.parseColor("#FFFF5722") // red — lost
+    // ── Colors ────────────────────────────────────────────────────────────
+    private val lockedColor  = Color.parseColor("#FF00E5FF")  // cyan
+    private val predictColor = Color.parseColor("#FFFFC107")  // amber
+    private val searchColor  = Color.parseColor("#FFFF5252")  // red
 
-    private val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    // ── Paints ────────────────────────────────────────────────────────────
+    private val bracketPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style       = Paint.Style.STROKE
-        strokeWidth = 3f * density
+        strokeWidth = 2.5f * density
+        strokeCap   = Paint.Cap.SQUARE
         color       = lockedColor
     }
 
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.argb(30, 0, 200, 83)
+        color = Color.argb(18, 0, 200, 255)
+    }
+
+    private val dashedPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style       = Paint.Style.STROKE
+        strokeWidth = 1f * density
+        color       = predictColor
+        pathEffect  = DashPathEffect(floatArrayOf(6f * density, 4f * density), 0f)
     }
 
     private val labelBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
-        color = Color.argb(180, 0, 0, 0)
+        color = Color.argb(160, 0, 0, 0)
     }
 
-    private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    private val labelPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color    = Color.WHITE
-        textSize = 12f * density
-        typeface = android.graphics.Typeface.MONOSPACE
+        textSize = 10.5f * density
+        typeface = android.graphics.Typeface.create("monospace", android.graphics.Typeface.BOLD)
     }
 
-    // State updated from worker thread — use @Volatile + post
-    @Volatile var boundingBox: RectF?       = null
+    private val confidencePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color    = Color.parseColor("#FF00E5FF")
+        textSize = 10f * density
+        typeface = android.graphics.Typeface.create("monospace", android.graphics.Typeface.NORMAL)
+    }
+
+    // ── State ─────────────────────────────────────────────────────────────
+    @Volatile var boundingBox: RectF?          = null
     @Volatile var trackingState: TrackingState = TrackingState.IDLE
-    @Volatile var objectLabel: String       = ""
-    @Volatile var confidence: Float         = 0f
+    @Volatile var objectLabel: String          = ""
+    @Volatile var confidence: Float            = 0f
+
+    // ── Pulse animation ───────────────────────────────────────────────────
+    private var pulseAlpha = 255
+    private val pulseAnimator = ValueAnimator.ofInt(255, 140).apply {
+        duration      = 800
+        repeatCount   = ValueAnimator.INFINITE
+        repeatMode    = ValueAnimator.REVERSE
+        interpolator  = LinearInterpolator()
+        addUpdateListener {
+            pulseAlpha = it.animatedValue as Int
+            if (trackingState == TrackingState.LOCKED) postInvalidate()
+        }
+        start()
+    }
 
     fun update(box: RectF?, state: TrackingState, label: String = "", conf: Float = 0f) {
         boundingBox   = box
@@ -62,45 +101,83 @@ class OverlayView @JvmOverloads constructor(
     }
 
     override fun onDraw(canvas: Canvas) {
-        val box    = boundingBox ?: return
-        val state  = trackingState
+        val box   = boundingBox ?: return
+        val state = trackingState
+        if (state == TrackingState.IDLE) return
 
-        val boxColor = when (state) {
-            TrackingState.LOCKED    -> lockedColor
-            TrackingState.PREDICTING-> predictColor
-            TrackingState.SEARCHING -> searchColor
-            TrackingState.IDLE      -> return
+        val color = when (state) {
+            TrackingState.LOCKED     -> lockedColor
+            TrackingState.PREDICTING -> predictColor
+            TrackingState.SEARCHING  -> searchColor
+            TrackingState.IDLE       -> return
         }
 
-        boxPaint.color  = boxColor
-        fillPaint.color = Color.argb(25, Color.red(boxColor), Color.green(boxColor), Color.blue(boxColor))
+        // ── Fill ──────────────────────────────────────────────────────────
+        fillPaint.color = Color.argb(18, Color.red(color), Color.green(color), Color.blue(color))
+        canvas.drawRoundRect(box, 4f * density, 4f * density, fillPaint)
 
-        // Filled rect
-        canvas.drawRoundRect(box, 8f * density, 8f * density, fillPaint)
-        // Border
-        canvas.drawRoundRect(box, 8f * density, 8f * density, boxPaint)
+        // ── Dashed perimeter when predicting ──────────────────────────────
+        if (state == TrackingState.PREDICTING) {
+            dashedPaint.color = color
+            canvas.drawRoundRect(box, 4f * density, 4f * density, dashedPaint)
+        }
 
-        // Label
-        val stateLabel = when (state) {
-            TrackingState.LOCKED     -> "🔒 LOCKED"
-            TrackingState.PREDICTING -> "⚡ PREDICTING"
-            TrackingState.SEARCHING  -> "🔍 SEARCHING"
+        // ── Corner brackets ───────────────────────────────────────────────
+        val alpha = if (state == TrackingState.LOCKED) pulseAlpha else 255
+        bracketPaint.color = Color.argb(alpha, Color.red(color), Color.green(color), Color.blue(color))
+
+        // Bracket arm length = 22% of the shorter box dimension
+        val arm = (minOf(box.width(), box.height()) * 0.22f).coerceIn(12f * density, 28f * density)
+
+        drawCornerBracket(canvas, box.left,  box.top,    arm,  1f,  1f)   // top-left
+        drawCornerBracket(canvas, box.right, box.top,    arm, -1f,  1f)   // top-right
+        drawCornerBracket(canvas, box.left,  box.bottom, arm,  1f, -1f)   // bottom-left
+        drawCornerBracket(canvas, box.right, box.bottom, arm, -1f, -1f)   // bottom-right
+
+        // Small dot at each corner centre
+        val dotPaint = Paint(bracketPaint).apply { style = Paint.Style.FILL; strokeWidth = 0f }
+        canvas.drawCircle(box.left,  box.top,    2.5f * density, dotPaint)
+        canvas.drawCircle(box.right, box.top,    2.5f * density, dotPaint)
+        canvas.drawCircle(box.left,  box.bottom, 2.5f * density, dotPaint)
+        canvas.drawCircle(box.right, box.bottom, 2.5f * density, dotPaint)
+
+        // ── Label ─────────────────────────────────────────────────────────
+        val stateStr = when (state) {
+            TrackingState.LOCKED     -> "LOCKED"
+            TrackingState.PREDICTING -> "PREDICT"
+            TrackingState.SEARCHING  -> "SEARCHING"
             TrackingState.IDLE       -> ""
         }
+        val confStr  = if (confidence > 0f) " ${(confidence * 100).toInt()}%" else ""
+        val fullLabel = if (objectLabel.isNotEmpty()) "$stateStr  $objectLabel$confStr" else stateStr
 
-        val label = if (objectLabel.isNotEmpty())
-            "$stateLabel  $objectLabel ${(confidence * 100).toInt()}%"
-        else stateLabel
+        labelPaint.color = color
+        val textW  = labelPaint.measureText(fullLabel) + 12f * density
+        val textH  = 18f * density
+        val lTop   = (box.top - textH - 2f * density).coerceAtLeast(2f)
 
-        val textW    = textPaint.measureText(label) + 16f * density
-        val textH    = 20f * density
-        val labelTop = (box.top - textH).coerceAtLeast(4f)
+        canvas.drawRoundRect(box.left, lTop, box.left + textW, lTop + textH, 3f, 3f, labelBgPaint)
+        canvas.drawText(fullLabel, box.left + 6f * density, lTop + textH - 4f * density, labelPaint)
+    }
 
-        canvas.drawRoundRect(
-            box.left, labelTop,
-            box.left + textW, labelTop + textH,
-            4f, 4f, labelBgPaint
-        )
-        canvas.drawText(label, box.left + 8f * density, labelTop + textH - 4f * density, textPaint)
+    /**
+     * Draw an L-shaped bracket at corner ([cx],[cy]).
+     * [sx]/[sy] control which direction the arms extend (±1).
+     */
+    private fun drawCornerBracket(
+        canvas: Canvas,
+        cx: Float, cy: Float,
+        arm: Float,
+        sx: Float, sy: Float
+    ) {
+        // Horizontal arm
+        canvas.drawLine(cx, cy, cx + arm * sx, cy, bracketPaint)
+        // Vertical arm
+        canvas.drawLine(cx, cy, cx, cy + arm * sy, bracketPaint)
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        pulseAnimator.cancel()
     }
 }
