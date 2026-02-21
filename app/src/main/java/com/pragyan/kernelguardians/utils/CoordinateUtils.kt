@@ -49,18 +49,26 @@ object CoordinateUtils {
         viewHeight: Int,
         isFrontCamera: Boolean = false
     ): RectF {
-        val scaleX = viewWidth.toFloat() / imageWidth.toFloat()
+        // CameraX PreviewView defaults to FILL_CENTER (scale-to-fill, centered).
+        // Use a uniform scale factor (same in X and Y) so boxes don't stretch.
+        // Then offset by half the letterbox/pillarbox to align with the preview.
+        val scaleX = viewWidth.toFloat()  / imageWidth.toFloat()
         val scaleY = viewHeight.toFloat() / imageHeight.toFloat()
+        val scale  = maxOf(scaleX, scaleY)   // FILL_CENTER picks the larger scale
 
-        var left   = box.left   * scaleX
-        var right  = box.right  * scaleX
-        val top    = box.top    * scaleY
-        val bottom = box.bottom * scaleY
+        // Centering offsets (the "black bar" sizes)
+        val offsetX = (viewWidth  - imageWidth  * scale) / 2f
+        val offsetY = (viewHeight - imageHeight * scale) / 2f
 
-        // Mirror X for front camera (lens output is already mirrored by CameraX)
+        var left   = box.left   * scale + offsetX
+        var right  = box.right  * scale + offsetX
+        val top    = box.top    * scale + offsetY
+        val bottom = box.bottom * scale + offsetY
+
+        // Mirror X for front camera
         if (isFrontCamera) {
-            left  = viewWidth - right
-            right = viewWidth - (box.left * scaleX)
+            left  = viewWidth - (box.right * scale + offsetX)
+            right = viewWidth - (box.left  * scale + offsetX)
         }
 
         return RectF(left, top, right, bottom)

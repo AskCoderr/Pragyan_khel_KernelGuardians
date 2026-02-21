@@ -79,7 +79,9 @@ class CameraAnalyzer(
         imageProxy.close()
 
         val enhanced = LowLightEnhancer.enhance(bitmap)
-        val inputImage = InputImage.fromBitmap(enhanced, 0)
+        // Pass the actual rotation so ML Kit returns correctly-oriented bounding boxes.
+        // Previously hardcoded to 0, which caused boxes to be misaligned on portrait devices.
+        val inputImage = InputImage.fromBitmap(enhanced, rotDeg)
 
         detector.process(inputImage)
             .addOnSuccessListener { objects ->
