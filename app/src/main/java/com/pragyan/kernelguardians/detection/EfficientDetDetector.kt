@@ -24,7 +24,7 @@ class EfficientDetDetector(context: Context) {
     private val tag = "EfficientDetDetector"
 
     companion object {
-        const val MODEL_FILE      = "efficientdet_lite2.tflite"
+        const val MODEL_FILE      = "efficientdet_lite0.tflite"
         const val MAX_RESULTS     = 10          // fewer results → less post-processing overhead
         const val SCORE_THRESHOLD = 0.40f       // slightly higher → fewer low-confidence junk boxes
     }
