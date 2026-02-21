@@ -91,6 +91,7 @@ class CameraAnalyzer(
         imageProxy.close()
 
         // Full ML pipeline every frame — NNAPI/GPU drives the detection rate
+        // detect() now computes appearance embeddings internally (Re-ID ready)
         val enhanced         = LowLightEnhancer.enhance(bitmap)
         val detectionResults = detector.detect(enhanced, imageWidth, imageHeight)
 

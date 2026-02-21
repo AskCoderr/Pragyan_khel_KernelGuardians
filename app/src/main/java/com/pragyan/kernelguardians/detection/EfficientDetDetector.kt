@@ -68,18 +68,25 @@ class EfficientDetDetector(context: Context) {
 
     /**
      * Run detection on [bitmap].
-     * Returns Kalman-smoothed results with stable tracking IDs.
+     * Returns Kalman-smoothed results with stable tracking IDs and appearance embeddings.
+     * Embeddings are computed from raw EfficientDet boxes before IoU tracking,
+     * so they reflect the detector's exact crop — not the Kalman-smoothed position.
      */
     fun detect(bitmap: Bitmap, imageWidth: Int, imageHeight: Int): List<DetectionResult> {
         val tensorImage = TensorImage.fromBitmap(bitmap)
         val detections  = detector.detect(tensorImage)
 
         val rawBoxes = detections.mapNotNull { det ->
-            val cat   = det.categories.firstOrNull() ?: return@mapNotNull null
+            val cat = det.categories.firstOrNull() ?: return@mapNotNull null
             Pair(det.boundingBox, Pair(cat.label ?: "unknown", cat.score))
         }
 
-        return iouTracker.update(rawBoxes)
+        // Compute appearance embeddings from raw bounding boxes BEFORE IoU tracking
+        val embeddings: List<FloatArray?> = rawBoxes.map { (box, _) ->
+            runCatching { AppearanceEmbedder.embed(bitmap, box) }.getOrNull()
+        }
+
+        return iouTracker.update(rawBoxes, embeddings)
     }
 
     fun resetTracking() = iouTracker.reset()

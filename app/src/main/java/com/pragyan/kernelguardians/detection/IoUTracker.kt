@@ -6,49 +6,52 @@ import com.pragyan.kernelguardians.tracking.KalmanFilter
 /**
  * SORT-style tracker: each track owns a [KalmanFilter].
  *
- * Improvement over plain IoU matching:
- *   - Kalman predicts each track's position before matching
- *   - IoU is computed between the PREDICTED box and new detections
- *   - Fast-moving objects bridge frame gaps without losing their ID
- *   - Unmatched tracks coast on Kalman predictions for MAX_MISS_FRAMES
- *     then get removed
+ * Matching pipeline — two stages per frame:
  *
- * Previously the tracker compared raw last-seen boxes, which broke when
- * an object moved more than its own width between frames.
+ *   Stage 1 — IoU (fast, position-based):
+ *     Standard Kalman-predicted box vs detection IoU.
+ *     Works for normal motion and bridging short occlusions.
+ *
+ *   Stage 2 — Appearance Re-ID (fallback for lost tracks):
+ *     For tracks that failed IoU matching (missCount > 0), compare the
+ *     track's stored appearance embedding against unmatched detections of
+ *     the SAME LABEL using cosine similarity.
+ *     Allows re-acquiring a previously locked object that moved far away
+ *     or temporarily left the frame.
  */
 class IoUTracker {
 
     companion object {
-        /** Minimum IoU between predicted track and new detection to match */
-        private const val IOU_THRESHOLD   = 0.20f   // slightly lower since we're comparing predicted boxes
-        /** Frames a track lives on prediction before being discarded */
+        private const val IOU_THRESHOLD   = 0.20f
+        /** Cosine similarity threshold for Re-ID re-acquisition */
+        private const val SIM_THRESHOLD   = 0.80f
         private const val MAX_MISS_FRAMES = 8
         private const val MAX_TRACKS      = 20
     }
 
-    private inner class Track(
-        val id: Int,
-        initialBox: RectF
-    ) {
+    private inner class Track(val id: Int, initialBox: RectF) {
         val kalman    = KalmanFilter()
         var missCount = 0
+        var label     = ""
 
-        /** The box we expose — either Kalman-corrected (on hit) or Kalman-predicted (on miss) */
         var box: RectF = RectF(initialBox)
+
+        /** Last-seen appearance embedding for Re-ID; updated on every hit */
+        var embedding: FloatArray? = null
 
         init { kalman.init(initialBox) }
 
-        /** Step 1 called each frame — advance the state machine, returns predicted box */
         fun predictNext(): RectF {
             box = kalman.predict()
             missCount++
             return box
         }
 
-        /** Step 2 called when a detection matches this track */
-        fun update(detectedBox: RectF) {
-            box = kalman.update(detectedBox)
+        fun update(detectedBox: RectF, detectedLabel: String, detectedEmbedding: FloatArray?) {
+            box       = kalman.update(detectedBox)
             missCount = 0
+            label     = detectedLabel
+            if (detectedEmbedding != null) embedding = detectedEmbedding
         }
     }
 
@@ -58,92 +61,102 @@ class IoUTracker {
     /**
      * Update the tracker with a new frame's detections.
      *
-     * @param rawBoxes  Unordered list of (boundingBox → (label, confidence))
-     * @return          DetectionResult list with stable tracking IDs and Kalman-smoothed boxes
+     * @param rawBoxes   (bounding box → (label, confidence)) for each detection
+     * @param embeddings Parallel list of appearance embeddings; may be empty or shorter than rawBoxes
+     * @return           Stable-ID DetectionResult list with Kalman-smoothed boxes and embeddings
      */
     fun update(
-        rawBoxes: List<Pair<RectF, Pair<String, Float>>>
+        rawBoxes:   List<Pair<RectF, Pair<String, Float>>>,
+        embeddings: List<FloatArray?> = emptyList()
     ): List<DetectionResult> {
+
+        fun embeddingAt(i: Int) = embeddings.getOrNull(i)
 
         // ── 1. Predict next position for all tracks ──────────────────────────
         val predictedBoxes = tracks.map { it.predictNext() }
 
-        val usedTrackIndices     = mutableSetOf<Int>()
-        val usedDetectionIndices = mutableSetOf<Int>()
-        val results              = mutableListOf<DetectionResult>()
+        val usedTi  = mutableSetOf<Int>()
+        val usedDi  = mutableSetOf<Int>()
+        val results = mutableListOf<DetectionResult>()
 
-        // ── 2. Build IoU matrix: predicted-track vs new-detection ─────────────
+        // ── 2. IoU matrix ────────────────────────────────────────────────────
         val ious = Array(tracks.size) { ti ->
-            FloatArray(rawBoxes.size) { di ->
-                iou(predictedBoxes[ti], rawBoxes[di].first)
-            }
+            FloatArray(rawBoxes.size) { di -> iou(predictedBoxes[ti], rawBoxes[di].first) }
         }
 
-        // ── 3. Greedy matching — highest IoU first ────────────────────────────
+        // ── 3. Stage-1: greedy IoU matching ──────────────────────────────────
         while (true) {
-            var bestIoU = IOU_THRESHOLD
-            var bestTi  = -1
-            var bestDi  = -1
-
+            var best = IOU_THRESHOLD; var bTi = -1; var bDi = -1
             for (ti in tracks.indices) {
-                if (ti in usedTrackIndices) continue
+                if (ti in usedTi) continue
                 for (di in rawBoxes.indices) {
-                    if (di in usedDetectionIndices) continue
-                    if (ious[ti][di] > bestIoU) {
-                        bestIoU = ious[ti][di]
-                        bestTi  = ti
-                        bestDi  = di
-                    }
+                    if (di in usedDi) continue
+                    if (ious[ti][di] > best) { best = ious[ti][di]; bTi = ti; bDi = di }
                 }
             }
-
-            if (bestTi == -1) break
-
-            val track       = tracks[bestTi]
-            val (box, meta) = rawBoxes[bestDi]
-            track.update(box)                             // Kalman update with real detection
-            usedTrackIndices.add(bestTi)
-            usedDetectionIndices.add(bestDi)
-
-            results.add(DetectionResult(track.id, meta.first, meta.second, RectF(track.box)))
+            if (bTi == -1) break
+            val track       = tracks[bTi]
+            val (box, meta) = rawBoxes[bDi]
+            track.update(box, meta.first, embeddingAt(bDi))
+            usedTi.add(bTi); usedDi.add(bDi)
+            results.add(DetectionResult(track.id, meta.first, meta.second, RectF(track.box), embeddingAt(bDi)))
         }
 
-        // ── 4. Unmatched detections → new tracks ──────────────────────────────
-        rawBoxes.indices.filter { it !in usedDetectionIndices }.forEach { di ->
+        // ── 4. Stage-2: Re-ID appearance matching ────────────────────────────
+        // For each unmatched track whose embedding we have, scan unmatched
+        // detections of the same label by cosine similarity.
+        for (ti in tracks.indices) {
+            if (ti in usedTi) continue
+            val track    = tracks[ti]
+            val trackEmb = track.embedding ?: continue      // no reference yet
+
+            var bestSim = SIM_THRESHOLD; var bestDi = -1
+            for (di in rawBoxes.indices) {
+                if (di in usedDi) continue
+                val (_, meta) = rawBoxes[di]
+                if (meta.first != track.label) continue     // same-label only
+                val detEmb = embeddingAt(di) ?: continue
+                val sim = AppearanceEmbedder.similarity(trackEmb, detEmb)
+                if (sim > bestSim) { bestSim = sim; bestDi = di }
+            }
+
+            if (bestDi == -1) continue
+
+            // Re-acquisition: update track with the appearance-matched detection
+            val (box, meta) = rawBoxes[bestDi]
+            track.update(box, meta.first, embeddingAt(bestDi))
+            usedTi.add(ti); usedDi.add(bestDi)
+            results.add(DetectionResult(track.id, meta.first, meta.second, RectF(track.box), embeddingAt(bestDi)))
+        }
+
+        // ── 5. Unmatched detections → new tracks ──────────────────────────────
+        rawBoxes.indices.filter { it !in usedDi }.forEach { di ->
             val (box, meta) = rawBoxes[di]
             if (tracks.size < MAX_TRACKS) {
-                val id = nextId++
-                tracks.add(Track(id, RectF(box)))
-                results.add(DetectionResult(id, meta.first, meta.second, RectF(box)))
+                val id    = nextId++
+                val track = Track(id, RectF(box))
+                track.label     = meta.first
+                track.embedding = embeddingAt(di)
+                tracks.add(track)
+                results.add(DetectionResult(id, meta.first, meta.second, RectF(box), embeddingAt(di)))
             }
         }
 
-        // ── 5. Remove stale tracks ────────────────────────────────────────────
+        // ── 6. Remove stale tracks ────────────────────────────────────────────
         tracks.removeAll { it.missCount > MAX_MISS_FRAMES }
 
         return results
     }
 
-    /** Reset all tracks (e.g. when camera restarts or app resumes). */
-    fun reset() {
-        tracks.clear()
-        nextId = 1
-    }
-
-    // ── IoU helper ────────────────────────────────────────────────────────────
+    fun reset() { tracks.clear(); nextId = 1 }
 
     private fun iou(a: RectF, b: RectF): Float {
-        val interLeft   = maxOf(a.left,   b.left)
-        val interTop    = maxOf(a.top,    b.top)
-        val interRight  = minOf(a.right,  b.right)
-        val interBottom = minOf(a.bottom, b.bottom)
-
-        val interW = (interRight  - interLeft).coerceAtLeast(0f)
-        val interH = (interBottom - interTop ).coerceAtLeast(0f)
-        val inter  = interW * interH
-
+        val iL = maxOf(a.left,  b.left);  val iT = maxOf(a.top,    b.top)
+        val iR = minOf(a.right, b.right); val iB = minOf(a.bottom, b.bottom)
+        val iW = (iR - iL).coerceAtLeast(0f)
+        val iH = (iB - iT).coerceAtLeast(0f)
+        val inter = iW * iH
         if (inter == 0f) return 0f
-
         val union = a.width() * a.height() + b.width() * b.height() - inter
         return if (union <= 0f) 0f else inter / union
     }

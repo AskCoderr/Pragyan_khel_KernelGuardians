@@ -16,5 +16,7 @@ data class DetectionResult(
     val trackingId: Int,
     val label: String,
     val confidence: Float,
-    val boundingBox: RectF
+    val boundingBox: RectF,
+    /** L2-normalised appearance embedding from [AppearanceEmbedder]; null until computed. */
+    val embedding: FloatArray? = null
 )

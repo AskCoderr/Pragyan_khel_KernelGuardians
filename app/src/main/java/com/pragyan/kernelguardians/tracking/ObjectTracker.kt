@@ -2,31 +2,37 @@ package com.pragyan.kernelguardians.tracking
 
 import android.graphics.PointF
 import android.graphics.RectF
+import com.pragyan.kernelguardians.detection.AppearanceEmbedder
 import com.pragyan.kernelguardians.detection.DetectionResult
 
 /**
  * Manages the "lock onto a subject" lifecycle.
  *
- * Since IoUTracker now runs a per-track Kalman filter (SORT-style),
- * ObjectTracker no longer needs its own KalmanFilter — the smoothed box
- * is already embedded in [DetectionResult.boundingBox].
+ * Re-ID integration:
+ *   On tap-to-lock: stores the detection's appearance embedding as a reference.
+ *   When state is SEARCHING (locked ID gone > MAX_PREDICTION_FRAMES):
+ *     Scans all current detections of the same label by cosine similarity.
+ *     If similarity > RE_ID_THRESHOLD, re-locks onto that detection ID.
+ *     This allows recovering the same object even if it left and re-entered the frame.
  *
  * States:
  *   IDLE       → no object selected
  *   LOCKED     → locked object found in this frame's detections
- *   PREDICTING → locked ID missing this frame; IoUTracker's Kalman is
- *                coasting — but the ID may still be re-matched next frame
- *   SEARCHING  → ID has been gone > [MAX_PREDICTION_FRAMES] frames (stale)
+ *   PREDICTING → locked ID missing this frame; IoUTracker's Kalman is coasting
+ *   SEARCHING  → ID gone > MAX_PREDICTION_FRAMES; Re-ID scanning active
  */
 class ObjectTracker {
 
     companion object {
-        /** Frames to show PREDICTING before giving up and showing SEARCHING */
         private const val MAX_PREDICTION_FRAMES = KalmanFilter.MAX_PREDICTION_FRAMES
+        /** Cosine similarity threshold for Re-ID re-lock */
+        private const val RE_ID_THRESHOLD = 0.78f
     }
 
-    private var lockedId:        Int?  = null
-    private var missedFrames:    Int   = 0
+    private var lockedId:            Int?         = null
+    private var missedFrames:        Int          = 0
+    private var referenceEmbedding:  FloatArray?  = null
+    private var referenceLabel:      String       = ""
 
     var currentState:      TrackingState = TrackingState.IDLE
         private set
@@ -39,11 +45,7 @@ class ObjectTracker {
 
     /**
      * Called when the user taps at [touchPoint] on screen.
-     * Selects the detected object whose mapped box centre is nearest the tap.
-     *
-     * @param touchPoint  Tap location in view/overlay space
-     * @param detections  Latest detections mapped to view space
-     * @return true if an object was locked
+     * Selects the nearest detection and stores its embedding as the Re-ID reference.
      */
     fun onUserTap(
         touchPoint: PointF,
@@ -60,20 +62,23 @@ class ObjectTracker {
         } ?: return false
 
         val (result, box) = nearest
-        lockedId          = result.trackingId
-        currentLabel      = result.label
-        currentConfidence = result.confidence
-        currentState      = TrackingState.LOCKED
-        currentBox        = box
-        missedFrames      = 0
+        lockedId           = result.trackingId
+        currentLabel       = result.label
+        currentConfidence  = result.confidence
+        currentState       = TrackingState.LOCKED
+        currentBox         = box
+        missedFrames       = 0
+
+        // Capture Re-ID reference
+        referenceEmbedding = result.embedding
+        referenceLabel     = result.label
+
         return true
     }
 
     /**
-     * Process a new set of detections (already mapped to view space).
-     * Called on every analysed frame.
-     *
-     * @return true if state changed (caller should update UI)
+     * Process a new set of detections.
+     * When SEARCHING, attempts Re-ID across same-label detections using stored embedding.
      */
     fun processDetections(
         detections: List<Pair<DetectionResult, RectF>>
@@ -87,34 +92,69 @@ class ObjectTracker {
 
         return if (match != null) {
             val (result, box) = match
-            currentBox        = box          // Kalman-smoothed box from IoUTracker
+            currentBox        = box
             currentLabel      = result.label
             currentConfidence = result.confidence
             missedFrames      = 0
-            val prev          = currentState
-            currentState      = TrackingState.LOCKED
+            // Update reference embedding with fresh observation
+            if (result.embedding != null) referenceEmbedding = result.embedding
+            val prev = currentState
+            currentState = TrackingState.LOCKED
             prev != TrackingState.LOCKED
+
         } else {
-            // Locked ID not in this frame — IoUTracker is coasting on Kalman prediction
-            // but may re-match next frame if the object reappears nearby
             missedFrames++
             val prev = currentState
             currentState = if (missedFrames >= MAX_PREDICTION_FRAMES) {
-                TrackingState.SEARCHING
+                // ── Re-ID scan ──────────────────────────────────────────────
+                val reIdResult = tryReId(detections)
+                if (reIdResult != null) {
+                    val (result, box) = reIdResult
+                    lockedId          = result.trackingId
+                    currentBox        = box
+                    currentLabel      = result.label
+                    currentConfidence = result.confidence
+                    missedFrames      = 0
+                    if (result.embedding != null) referenceEmbedding = result.embedding
+                    TrackingState.LOCKED
+                } else {
+                    TrackingState.SEARCHING
+                }
             } else {
                 TrackingState.PREDICTING
             }
-            // Keep showing the last known box while predicting
             prev != currentState
         }
     }
 
+    /**
+     * Scans [detections] for the best same-label candidate by cosine similarity.
+     * Returns null if no candidate exceeds [RE_ID_THRESHOLD].
+     */
+    private fun tryReId(
+        detections: List<Pair<DetectionResult, RectF>>
+    ): Pair<DetectionResult, RectF>? {
+        val ref = referenceEmbedding ?: return null
+        var bestSim  = RE_ID_THRESHOLD
+        var bestPair: Pair<DetectionResult, RectF>? = null
+
+        for ((result, box) in detections) {
+            if (result.label != referenceLabel) continue
+            val emb = result.embedding ?: continue
+            val sim = AppearanceEmbedder.similarity(ref, emb)
+            if (sim > bestSim) { bestSim = sim; bestPair = Pair(result, box) }
+        }
+        return bestPair
+    }
+
     fun clearLock() {
-        lockedId      = null
-        currentState  = TrackingState.IDLE
-        currentBox    = null
-        currentLabel  = ""
-        missedFrames  = 0
+        lockedId           = null
+        currentState       = TrackingState.IDLE
+        currentBox         = null
+        currentLabel       = ""
+        missedFrames       = 0
+        referenceEmbedding = null
+        referenceLabel     = ""
     }
 
     val isLocked: Boolean get() = lockedId != null
