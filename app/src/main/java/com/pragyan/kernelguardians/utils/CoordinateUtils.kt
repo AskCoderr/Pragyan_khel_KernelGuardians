@@ -47,25 +47,27 @@ object CoordinateUtils {
         imageHeight: Int,
         viewWidth: Int,
         viewHeight: Int,
-        isFrontCamera: Boolean = false
+        isFrontCamera: Boolean = false,
+        rotDeg: Int = 0
     ): RectF {
-        // CameraX PreviewView defaults to FILL_CENTER (scale-to-fill, centered).
-        // Use a uniform scale factor (same in X and Y) so boxes don't stretch.
-        // Then offset by half the letterbox/pillarbox to align with the preview.
-        val scaleX = viewWidth.toFloat()  / imageWidth.toFloat()
-        val scaleY = viewHeight.toFloat() / imageHeight.toFloat()
-        val scale  = maxOf(scaleX, scaleY)   // FILL_CENTER picks the larger scale
+        // When the sensor image is rotated 90° or 270°, width and height are swapped
+        // relative to what the preview shows — compensate before scaling.
+        val effectiveImgW = if (rotDeg == 90 || rotDeg == 270) imageHeight else imageWidth
+        val effectiveImgH = if (rotDeg == 90 || rotDeg == 270) imageWidth  else imageHeight
 
-        // Centering offsets (the "black bar" sizes)
-        val offsetX = (viewWidth  - imageWidth  * scale) / 2f
-        val offsetY = (viewHeight - imageHeight * scale) / 2f
+        // CameraX PreviewView defaults to FILL_CENTER (scale-to-fill, centered).
+        val scaleX = viewWidth.toFloat()  / effectiveImgW.toFloat()
+        val scaleY = viewHeight.toFloat() / effectiveImgH.toFloat()
+        val scale  = maxOf(scaleX, scaleY)
+
+        val offsetX = (viewWidth  - effectiveImgW * scale) / 2f
+        val offsetY = (viewHeight - effectiveImgH * scale) / 2f
 
         var left   = box.left   * scale + offsetX
         var right  = box.right  * scale + offsetX
         val top    = box.top    * scale + offsetY
         val bottom = box.bottom * scale + offsetY
 
-        // Mirror X for front camera
         if (isFrontCamera) {
             left  = viewWidth - (box.right * scale + offsetX)
             right = viewWidth - (box.left  * scale + offsetX)

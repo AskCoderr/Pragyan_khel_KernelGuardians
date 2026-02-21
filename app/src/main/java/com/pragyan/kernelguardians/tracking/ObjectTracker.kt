@@ -2,22 +2,22 @@ package com.pragyan.kernelguardians.tracking
 
 import android.graphics.PointF
 import android.graphics.RectF
-import com.google.mlkit.vision.objects.DetectedObject
-import com.pragyan.kernelguardians.utils.CoordinateUtils
+import com.pragyan.kernelguardians.detection.DetectionResult
 
 /**
- * Manages the "lock onto a subject" lifecycle:
+ * Manages the "lock onto a subject" lifecycle using [DetectionResult]
+ * (model-agnostic, replaces ML Kit DetectedObject).
  *
  *  1. User taps → [onUserTap] picks the closest detected object.
- *  2. [processDetections] runs every frame in STREAM_MODE.
- *     - If the locked object ID reappears, update the Kalman Filter.
- *     - If it disappears, switch to PREDICTING (Kalman-only).
- *     - After [KalmanFilter.MAX_PREDICTION_FRAMES], switch to SEARCHING.
+ *  2. [processDetections] runs every frame.
+ *     - Locked object ID found → update Kalman, LOCKED.
+ *     - Not found → Kalman predicts, PREDICTING.
+ *     - Too many misses → SEARCHING.
  *  3. [clearLock] releases the lock.
  */
 class ObjectTracker {
 
-    private val kalman        = KalmanFilter()
+    private val kalman         = KalmanFilter()
     private var lockedId: Int? = null
 
     var currentState: TrackingState = TrackingState.IDLE
@@ -31,35 +31,30 @@ class ObjectTracker {
 
     /**
      * Called when the user taps at [touchPoint] on screen.
-     * Selects the detected object whose box centre is closest to the tap.
+     * Selects the detected object whose mapped box centre is nearest the tap.
      *
-     * @param touchPoint     Tap location in view/overlay space
-     * @param detections     Latest list of [DetectedObject] already mapped to view space
-     * @param imageWidth     Original image width (for mapping if needed)
-     * @param imageHeight    Original image height
-     * @param viewWidth      View width
-     * @param viewHeight     View height
+     * @param touchPoint  Tap location in view/overlay space
+     * @param detections  Latest detections already mapped to view space
      * @return true if an object was locked
      */
     fun onUserTap(
         touchPoint: PointF,
-        detections: List<Pair<DetectedObject, RectF>>,
+        detections: List<Pair<DetectionResult, RectF>>,
         imageWidth: Int, imageHeight: Int,
         viewWidth: Int,  viewHeight: Int
     ): Boolean {
         if (detections.isEmpty()) return false
 
-        // Find nearest object center to tap
         val nearest = detections.minByOrNull { (_, box) ->
             val dx = box.centerX() - touchPoint.x
             val dy = box.centerY() - touchPoint.y
             dx * dx + dy * dy
         } ?: return false
 
-        val (obj, box) = nearest
-        lockedId          = obj.trackingId
-        currentLabel      = obj.labels.firstOrNull()?.text ?: "Object"
-        currentConfidence = obj.labels.firstOrNull()?.confidence ?: 0f
+        val (result, box) = nearest
+        lockedId          = result.trackingId
+        currentLabel      = result.label
+        currentConfidence = result.confidence
         currentState      = TrackingState.LOCKED
         currentBox        = box
         kalman.init(box)
@@ -67,36 +62,33 @@ class ObjectTracker {
     }
 
     /**
-     * Process a new set of [DetectedObject]s mapped to view space.
-     * Should be called on every analyzed frame.
+     * Process a new set of detections mapped to view space.
+     * Called on every analyzed frame.
      *
      * @return true if state changed (caller should update UI)
      */
     fun processDetections(
-        detections: List<Pair<DetectedObject, RectF>>
+        detections: List<Pair<DetectionResult, RectF>>
     ): Boolean {
         if (lockedId == null) {
             currentState = TrackingState.IDLE
             return false
         }
 
-        // Always predict first (advances Kalman by 1 frame)
         val predicted = kalman.predict()
 
-        // Try to find the locked object
-        val match = detections.firstOrNull { (obj, _) -> obj.trackingId == lockedId }
+        val match = detections.firstOrNull { (result, _) -> result.trackingId == lockedId }
 
         return if (match != null) {
-            val (obj, box)  = match
-            val corrected   = kalman.update(box)
-            currentBox      = corrected
-            currentLabel    = obj.labels.firstOrNull()?.text ?: currentLabel
-            currentConfidence = obj.labels.firstOrNull()?.confidence ?: currentConfidence
-            val prev = currentState
-            currentState    = TrackingState.LOCKED
+            val (result, box) = match
+            val corrected     = kalman.update(box)
+            currentBox        = corrected
+            currentLabel      = result.label
+            currentConfidence = result.confidence
+            val prev          = currentState
+            currentState      = TrackingState.LOCKED
             prev != TrackingState.LOCKED
         } else {
-            // Object not found in this frame
             currentBox = predicted
             val prev   = currentState
             currentState = if (kalman.predictionFrameCount >= KalmanFilter.MAX_PREDICTION_FRAMES) {
@@ -108,7 +100,6 @@ class ObjectTracker {
         }
     }
 
-    /** Release the current lock and reset. */
     fun clearLock() {
         lockedId     = null
         currentState = TrackingState.IDLE

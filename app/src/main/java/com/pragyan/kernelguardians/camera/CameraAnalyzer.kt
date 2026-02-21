@@ -1,19 +1,16 @@
 package com.pragyan.kernelguardians.camera
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
-import android.graphics.PointF
 import android.graphics.RectF
 import android.graphics.YuvImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.objects.DetectedObject
-import com.google.mlkit.vision.objects.ObjectDetection
-import com.google.mlkit.vision.objects.ObjectDetector
-import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
+import com.pragyan.kernelguardians.detection.DetectionResult
+import com.pragyan.kernelguardians.detection.EfficientDetDetector
 import com.pragyan.kernelguardians.tracking.ObjectTracker
 import com.pragyan.kernelguardians.tracking.TrackingState
 import com.pragyan.kernelguardians.utils.CoordinateUtils
@@ -23,9 +20,10 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 class CameraAnalyzer(
+    private val context: Context,
     private val tracker: ObjectTracker,
     private val onResult: (
-        detections: List<Pair<DetectedObject, RectF>>,
+        detections: List<Pair<DetectionResult, RectF>>,
         state: TrackingState,
         box: RectF?,
         label: String,
@@ -40,13 +38,8 @@ class CameraAnalyzer(
         private const val MIN_FRAME_GAP_MS = 33L
     }
 
-    private val detector: ObjectDetector = ObjectDetection.getClient(
-        ObjectDetectorOptions.Builder()
-            .setDetectorMode(ObjectDetectorOptions.STREAM_MODE)
-            .enableClassification()
-            .enableMultipleObjects()
-            .build()
-    )
+    // ── EfficientDet-Lite2 replaces ML Kit Object Detection ──────────────────
+    private val detector = EfficientDetDetector(context)
 
     private val isProcessing    = AtomicBoolean(false)
     private val lastProcessedAt = AtomicLong(0L)
@@ -54,6 +47,9 @@ class CameraAnalyzer(
     private var fpsFrameCount   = 0
     private var fpsWindowStart  = System.currentTimeMillis()
     private var currentFps      = 0f
+
+    var viewW: Int = 1
+    var viewH: Int = 1
 
     @SuppressLint("UnsafeOptInUsageError")
     override fun analyze(imageProxy: ImageProxy) {
@@ -78,60 +74,54 @@ class CameraAnalyzer(
         val imageHeight = imageProxy.height
         imageProxy.close()
 
+        // Apply low-light enhancement to both the ML input and the display frame
         val enhanced = LowLightEnhancer.enhance(bitmap)
-        // Pass the actual rotation so ML Kit returns correctly-oriented bounding boxes.
-        // Previously hardcoded to 0, which caused boxes to be misaligned on portrait devices.
-        val inputImage = InputImage.fromBitmap(enhanced, rotDeg)
 
-        detector.process(inputImage)
-            .addOnSuccessListener { objects ->
-                val mapped = objects.map { obj ->
-                    val viewBox = CoordinateUtils.mapBoundingBoxToView(
-                        box         = obj.boundingBox.toRectF(),
-                        imageWidth  = imageWidth,
-                        imageHeight = imageHeight,
-                        viewWidth   = viewW,
-                        viewHeight  = viewH
-                    )
-                    Pair(obj, viewBox)
-                }
+        // Run EfficientDet-Lite2 — returns DetectionResult list with stable IDs
+        val detectionResults = detector.detect(enhanced, imageWidth, imageHeight)
 
-                tracker.processDetections(mapped)
+        // Map boxes from image space → view/overlay space
+        val mapped = detectionResults.map { result ->
+            val viewBox = CoordinateUtils.mapBoundingBoxToView(
+                box         = result.boundingBox,
+                imageWidth  = imageWidth,
+                imageHeight = imageHeight,
+                viewWidth   = viewW,
+                viewHeight  = viewH,
+                rotDeg      = rotDeg
+            )
+            Pair(result, viewBox)
+        }
 
-                fpsFrameCount++
-                val elapsed = System.currentTimeMillis() - fpsWindowStart
-                if (elapsed >= 1000L) {
-                    currentFps     = fpsFrameCount * 1000f / elapsed
-                    fpsFrameCount  = 0
-                    fpsWindowStart = System.currentTimeMillis()
-                }
+        tracker.processDetections(mapped)
 
-                onResult(
-                    mapped,
-                    tracker.currentState,
-                    tracker.currentBox,
-                    tracker.currentLabel,
-                    tracker.currentConfidence,
-                    currentFps,
-                    bitmap,
-                    rotDeg
-                )
-            }
-            .addOnFailureListener { /* silently skip bad frames */ }
-            .addOnCompleteListener { isProcessing.set(false) }
+        fpsFrameCount++
+        val elapsed = System.currentTimeMillis() - fpsWindowStart
+        if (elapsed >= 1000L) {
+            currentFps     = fpsFrameCount * 1000f / elapsed
+            fpsFrameCount  = 0
+            fpsWindowStart = System.currentTimeMillis()
+        }
+
+        onResult(
+            mapped,
+            tracker.currentState,
+            tracker.currentBox,
+            tracker.currentLabel,
+            tracker.currentConfidence,
+            currentFps,
+            bitmap,
+            rotDeg
+        )
+
+        isProcessing.set(false)
     }
-
-    var viewW: Int = 1
-    var viewH: Int = 1
 
     fun shutdown() {
         detector.close()
         LowLightEnhancer.release()
     }
 }
-
-private fun android.graphics.Rect.toRectF() =
-    RectF(left.toFloat(), top.toFloat(), right.toFloat(), bottom.toFloat())
 
 @SuppressLint("UnsafeOptInUsageError")
 private fun ImageProxy.toBitmap(): Bitmap? {

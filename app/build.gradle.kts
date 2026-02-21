@@ -63,8 +63,9 @@ dependencies {
 
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
+    implementation("org.tensorflow:tensorflow-lite-task-vision:0.4.4")
 
-    implementation("com.google.mlkit:object-detection:17.0.2")
+    implementation("com.google.mlkit:object-detection:17.0.2")  // kept for segmentation APIs
 
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
 

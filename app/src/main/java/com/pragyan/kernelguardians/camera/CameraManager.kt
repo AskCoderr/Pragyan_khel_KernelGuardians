@@ -16,7 +16,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
-import com.google.mlkit.vision.objects.DetectedObject
+import com.pragyan.kernelguardians.detection.DetectionResult
 import com.pragyan.kernelguardians.tracking.ObjectTracker
 import com.pragyan.kernelguardians.tracking.TrackingState
 import com.pragyan.kernelguardians.utils.CoordinateUtils
@@ -46,7 +46,7 @@ class CameraManager(
     private var analyzer: CameraAnalyzer? = null
     private val cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
-    private var lastDetections: List<Pair<DetectedObject, RectF>> = emptyList()
+    private var lastDetections: List<Pair<DetectionResult, RectF>> = emptyList()
     private var imageWidth  = 1
 
     @SuppressLint("ClickableViewAccessibility", "UnsafeOptInUsageError")
@@ -64,7 +64,7 @@ class CameraManager(
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
 
-            val cameraAnalyzer = CameraAnalyzer(tracker) { detections, state, box, label, conf, fps, frameBitmap, rotDeg ->
+            val cameraAnalyzer = CameraAnalyzer(context, tracker) { detections, state, box, label, conf, fps, frameBitmap, rotDeg ->
                 lastDetections = detections
                 imageWidth = frameBitmap.width
                 onAnalysisResult(state, box, label, conf, fps, frameBitmap, rotDeg)
