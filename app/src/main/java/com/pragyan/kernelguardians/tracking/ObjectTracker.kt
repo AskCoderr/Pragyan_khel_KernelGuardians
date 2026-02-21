@@ -5,28 +5,36 @@ import android.graphics.RectF
 import com.pragyan.kernelguardians.detection.DetectionResult
 
 /**
- * Manages the "lock onto a subject" lifecycle using [DetectionResult]
- * (model-agnostic, replaces ML Kit DetectedObject).
+ * Manages the "lock onto a subject" lifecycle.
  *
- *  1. User taps → [onUserTap] picks the closest detected object.
- *  2. [processDetections] runs every frame.
- *     - Locked object ID found → update Kalman, LOCKED.
- *     - Not found → Kalman predicts, PREDICTING.
- *     - Too many misses → SEARCHING.
- *  3. [clearLock] releases the lock.
+ * Since IoUTracker now runs a per-track Kalman filter (SORT-style),
+ * ObjectTracker no longer needs its own KalmanFilter — the smoothed box
+ * is already embedded in [DetectionResult.boundingBox].
+ *
+ * States:
+ *   IDLE       → no object selected
+ *   LOCKED     → locked object found in this frame's detections
+ *   PREDICTING → locked ID missing this frame; IoUTracker's Kalman is
+ *                coasting — but the ID may still be re-matched next frame
+ *   SEARCHING  → ID has been gone > [MAX_PREDICTION_FRAMES] frames (stale)
  */
 class ObjectTracker {
 
-    private val kalman         = KalmanFilter()
-    private var lockedId: Int? = null
+    companion object {
+        /** Frames to show PREDICTING before giving up and showing SEARCHING */
+        private const val MAX_PREDICTION_FRAMES = KalmanFilter.MAX_PREDICTION_FRAMES
+    }
 
-    var currentState: TrackingState = TrackingState.IDLE
+    private var lockedId:        Int?  = null
+    private var missedFrames:    Int   = 0
+
+    var currentState:      TrackingState = TrackingState.IDLE
         private set
-    var currentBox: RectF? = null
+    var currentBox:        RectF?        = null
         private set
-    var currentLabel: String = ""
+    var currentLabel:      String        = ""
         private set
-    var currentConfidence: Float = 0f
+    var currentConfidence: Float         = 0f
         private set
 
     /**
@@ -34,7 +42,7 @@ class ObjectTracker {
      * Selects the detected object whose mapped box centre is nearest the tap.
      *
      * @param touchPoint  Tap location in view/overlay space
-     * @param detections  Latest detections already mapped to view space
+     * @param detections  Latest detections mapped to view space
      * @return true if an object was locked
      */
     fun onUserTap(
@@ -57,13 +65,13 @@ class ObjectTracker {
         currentConfidence = result.confidence
         currentState      = TrackingState.LOCKED
         currentBox        = box
-        kalman.init(box)
+        missedFrames      = 0
         return true
     }
 
     /**
-     * Process a new set of detections mapped to view space.
-     * Called on every analyzed frame.
+     * Process a new set of detections (already mapped to view space).
+     * Called on every analysed frame.
      *
      * @return true if state changed (caller should update UI)
      */
@@ -75,37 +83,38 @@ class ObjectTracker {
             return false
         }
 
-        val predicted = kalman.predict()
-
         val match = detections.firstOrNull { (result, _) -> result.trackingId == lockedId }
 
         return if (match != null) {
             val (result, box) = match
-            val corrected     = kalman.update(box)
-            currentBox        = corrected
+            currentBox        = box          // Kalman-smoothed box from IoUTracker
             currentLabel      = result.label
             currentConfidence = result.confidence
+            missedFrames      = 0
             val prev          = currentState
             currentState      = TrackingState.LOCKED
             prev != TrackingState.LOCKED
         } else {
-            currentBox = predicted
-            val prev   = currentState
-            currentState = if (kalman.predictionFrameCount >= KalmanFilter.MAX_PREDICTION_FRAMES) {
+            // Locked ID not in this frame — IoUTracker is coasting on Kalman prediction
+            // but may re-match next frame if the object reappears nearby
+            missedFrames++
+            val prev = currentState
+            currentState = if (missedFrames >= MAX_PREDICTION_FRAMES) {
                 TrackingState.SEARCHING
             } else {
                 TrackingState.PREDICTING
             }
+            // Keep showing the last known box while predicting
             prev != currentState
         }
     }
 
     fun clearLock() {
-        lockedId     = null
-        currentState = TrackingState.IDLE
-        currentBox   = null
-        currentLabel = ""
-        kalman.reset()
+        lockedId      = null
+        currentState  = TrackingState.IDLE
+        currentBox    = null
+        currentLabel  = ""
+        missedFrames  = 0
     }
 
     val isLocked: Boolean get() = lockedId != null

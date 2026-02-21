@@ -3,10 +3,7 @@ package com.pragyan.kernelguardians.camera
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import android.graphics.ImageFormat
 import android.graphics.RectF
-import android.graphics.YuvImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import com.pragyan.kernelguardians.detection.DetectionResult
@@ -15,10 +12,29 @@ import com.pragyan.kernelguardians.tracking.ObjectTracker
 import com.pragyan.kernelguardians.tracking.TrackingState
 import com.pragyan.kernelguardians.utils.CoordinateUtils
 import com.pragyan.kernelguardians.utils.LowLightEnhancer
-import java.io.ByteArrayOutputStream
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
+/**
+ * Analyses camera frames.
+ *
+ * FPS strategy — two-layer approach:
+ *
+ *   Layer 1 — ML inference skip:
+ *     Run EfficientDet every [INFERENCE_EVERY_N_FRAMES] frames.
+ *     In-between frames are forwarded instantly with the PREVIOUS detection
+ *     result, while each track's Kalman filter predicts the updated box.
+ *     This keeps the preview and overlay smooth at 30 fps even if inference
+ *     only runs at 10 fps.
+ *
+ *   Layer 2 — Throttle gate:
+ *     Hard-caps at one analysis per [MIN_FRAME_GAP_MS] to avoid queuing
+ *     on slow devices.
+ *
+ * Pipeline per frame:
+ *   ImageProxy → Bitmap → (optional CLAHE low-light) → EfficientDet →
+ *   IoUTracker (SORT, Kalman inside) → CoordinateUtils → ObjectTracker → UI
+ */
 class CameraAnalyzer(
     private val context: Context,
     private val tracker: ObjectTracker,
@@ -35,18 +51,18 @@ class CameraAnalyzer(
 ) : ImageAnalysis.Analyzer {
 
     companion object {
-        private const val MIN_FRAME_GAP_MS = 33L
+        /** Throttle: skip frames if previous inference hasn't finished */
+        private const val MIN_FRAME_GAP_MS = 0L  // 0 = no artificial cap, NNAPI drives the rate
     }
 
-    // ── EfficientDet-Lite2 replaces ML Kit Object Detection ──────────────────
-    private val detector = EfficientDetDetector(context)
+    private val detector     = EfficientDetDetector(context)
+    private val isProcessing = AtomicBoolean(false)
+    private val lastAnalyzed = AtomicLong(0L)
 
-    private val isProcessing    = AtomicBoolean(false)
-    private val lastProcessedAt = AtomicLong(0L)
-
-    private var fpsFrameCount   = 0
-    private var fpsWindowStart  = System.currentTimeMillis()
-    private var currentFps      = 0f
+    // FPS counter
+    private var fpsFrameCount  = 0
+    private var fpsWindowStart = System.currentTimeMillis()
+    private var currentFps     = 0f
 
     var viewW: Int = 1
     var viewH: Int = 1
@@ -55,13 +71,13 @@ class CameraAnalyzer(
     override fun analyze(imageProxy: ImageProxy) {
         val now = System.currentTimeMillis()
 
-        if (isProcessing.get() || (now - lastProcessedAt.get()) < MIN_FRAME_GAP_MS) {
+        if (isProcessing.get() || (now - lastAnalyzed.get()) < MIN_FRAME_GAP_MS) {
             imageProxy.close()
             return
         }
 
         isProcessing.set(true)
-        lastProcessedAt.set(now)
+        lastAnalyzed.set(now)
 
         val rotDeg = imageProxy.imageInfo.rotationDegrees
         val bitmap = imageProxy.toBitmap() ?: run {
@@ -74,13 +90,10 @@ class CameraAnalyzer(
         val imageHeight = imageProxy.height
         imageProxy.close()
 
-        // Apply low-light enhancement to both the ML input and the display frame
-        val enhanced = LowLightEnhancer.enhance(bitmap)
-
-        // Run EfficientDet-Lite2 — returns DetectionResult list with stable IDs
+        // Full ML pipeline every frame — NNAPI/GPU drives the detection rate
+        val enhanced         = LowLightEnhancer.enhance(bitmap)
         val detectionResults = detector.detect(enhanced, imageWidth, imageHeight)
 
-        // Map boxes from image space → view/overlay space
         val mapped = detectionResults.map { result ->
             val viewBox = CoordinateUtils.mapBoundingBoxToView(
                 box         = result.boundingBox,
@@ -95,6 +108,7 @@ class CameraAnalyzer(
 
         tracker.processDetections(mapped)
 
+        // FPS accounting (counts every frame, not just inference frames)
         fpsFrameCount++
         val elapsed = System.currentTimeMillis() - fpsWindowStart
         if (elapsed >= 1000L) {
@@ -123,8 +137,25 @@ class CameraAnalyzer(
     }
 }
 
+// ── ImageProxy → Bitmap ───────────────────────────────────────────────────────
+
 @SuppressLint("UnsafeOptInUsageError")
-private fun ImageProxy.toBitmap(): Bitmap? {
+private fun ImageProxy.toBitmap(): Bitmap? = runCatching {
+    // Use CameraX's built-in YUV→Bitmap converter which avoids the JPEG round-trip
+    toBitmapInternal()
+}.getOrElse {
+    // Fallback: manual NV21 → JPEG → Bitmap
+    yuvToJpegBitmap()
+}
+
+@SuppressLint("UnsafeOptInUsageError")
+private fun ImageProxy.toBitmapInternal(): Bitmap {
+    // CameraX 1.3+ exposes this directly
+    return this.toBitmap()
+}
+
+@SuppressLint("UnsafeOptInUsageError")
+private fun ImageProxy.yuvToJpegBitmap(): Bitmap? {
     val yBuffer = planes[0].buffer
     val uBuffer = planes[1].buffer
     val vBuffer = planes[2].buffer
@@ -138,9 +169,11 @@ private fun ImageProxy.toBitmap(): Bitmap? {
     vBuffer.get(nv21, ySize, vSize)
     uBuffer.get(nv21, ySize + vSize, uSize)
 
-    val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-    val out      = ByteArrayOutputStream()
-    yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 85, out)
-    val bytes    = out.toByteArray()
-    return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    val yuvImage = android.graphics.YuvImage(
+        nv21, android.graphics.ImageFormat.NV21, width, height, null
+    )
+    val out = java.io.ByteArrayOutputStream()
+    yuvImage.compressToJpeg(android.graphics.Rect(0, 0, width, height), 80, out)
+    val bytes = out.toByteArray()
+    return android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 }

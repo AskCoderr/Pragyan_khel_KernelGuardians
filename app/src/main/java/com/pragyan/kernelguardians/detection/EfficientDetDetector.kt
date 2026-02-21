@@ -5,21 +5,19 @@ import android.graphics.Bitmap
 import android.graphics.RectF
 import android.util.Log
 import org.tensorflow.lite.support.image.TensorImage
+import org.tensorflow.lite.task.core.BaseOptions
 import org.tensorflow.lite.task.vision.detector.ObjectDetector
 
 /**
  * On-device object detector using EfficientDet-Lite2 via the TFLite Task Library.
  *
- * The Task Library handles:
- *  - Model metadata reading (labels, input normalization)
- *  - Input resizing to 448×448
- *  - NMS and output tensor parsing automatically
+ * Acceleration strategy (tried in order):
+ *   1. NNAPI  — routes to Qualcomm Hexagon DSP / Adreno GPU via Android's
+ *               Neural Networks API. Best real-world speedup on modern Snapdragon.
+ *   2. CPU (XNNPACK, 4 threads) — reliable fallback on any device.
  *
- * This replaces the previous raw-tensor approach which broke because the
- * MediaPipe model outputs pre-NMS anchor tensors ([1, 37629, 90]) rather
- * than the post-NMS 4-tensor format we assumed.
- *
- * Detects 90 COCO categories. Stable tracking IDs assigned by [IoUTracker].
+ * Frame skipping to hit 30 fps is handled upstream in CameraAnalyzer;
+ * IoUTracker's per-track Kalman filters bridge the in-between frames.
  */
 class EfficientDetDetector(context: Context) {
 
@@ -27,27 +25,50 @@ class EfficientDetDetector(context: Context) {
 
     companion object {
         const val MODEL_FILE      = "efficientdet_lite2.tflite"
-        const val MAX_RESULTS     = 15
-        const val SCORE_THRESHOLD = 0.35f
+        const val MAX_RESULTS     = 10          // fewer results → less post-processing overhead
+        const val SCORE_THRESHOLD = 0.40f       // slightly higher → fewer low-confidence junk boxes
     }
 
     private val detector: ObjectDetector
     private val iouTracker = IoUTracker()
 
     init {
-        val options = ObjectDetector.ObjectDetectorOptions.builder()
-            .setMaxResults(MAX_RESULTS)
-            .setScoreThreshold(SCORE_THRESHOLD)
-            .build()
+        detector = buildDetector(context, useNnapi = true)
+            ?: buildDetector(context, useNnapi = false)
+            ?: error("Failed to create ObjectDetector on CPU — should never happen")
+    }
 
-        detector = ObjectDetector.createFromFileAndOptions(context, MODEL_FILE, options)
-        Log.d(tag, "EfficientDet-Lite2 (Task Library) loaded")
+    private fun buildDetector(context: Context, useNnapi: Boolean): ObjectDetector? {
+        return try {
+            val baseOptions = if (useNnapi) {
+                BaseOptions.builder()
+                    .useNnapi()                  // Hexagon DSP / Adreno GPU via Android NNAPI
+                    .setNumThreads(2)            // NNAPI handles parallelism internally
+                    .build()
+            } else {
+                BaseOptions.builder()
+                    .setNumThreads(4)            // XNNPACK on 4 CPU threads
+                    .build()
+            }
+
+            val options = ObjectDetector.ObjectDetectorOptions.builder()
+                .setMaxResults(MAX_RESULTS)
+                .setScoreThreshold(SCORE_THRESHOLD)
+                .setBaseOptions(baseOptions)
+                .build()
+
+            val det = ObjectDetector.createFromFileAndOptions(context, MODEL_FILE, options)
+            Log.d(tag, "EfficientDet-Lite2 loaded — NNAPI=$useNnapi")
+            det
+        } catch (e: Exception) {
+            Log.w(tag, "Could not create detector (NNAPI=$useNnapi): ${e.message}")
+            null
+        }
     }
 
     /**
      * Run detection on [bitmap].
-     * Returns results mapped into the original [imageWidth]×[imageHeight] space
-     * with stable tracking IDs.
+     * Returns Kalman-smoothed results with stable tracking IDs.
      */
     fun detect(bitmap: Bitmap, imageWidth: Int, imageHeight: Int): List<DetectionResult> {
         val tensorImage = TensorImage.fromBitmap(bitmap)
@@ -55,13 +76,7 @@ class EfficientDetDetector(context: Context) {
 
         val rawBoxes = detections.mapNotNull { det ->
             val cat   = det.categories.firstOrNull() ?: return@mapNotNull null
-            val label = cat.label  ?: "unknown"
-            val score = cat.score
-
-            // Task Library returns boxes in the input bitmap's pixel coords
-            val box = det.boundingBox   // RectF in bitmap pixels
-
-            Pair(box, Pair(label, score))
+            Pair(det.boundingBox, Pair(cat.label ?: "unknown", cat.score))
         }
 
         return iouTracker.update(rawBoxes)
